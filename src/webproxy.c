@@ -21,32 +21,38 @@
 #include "mpool.h"
 #include "khash.h"
 
+#define VERSION             "beta-0.1"
 #define DEFAULT_ADDR        "127.0.0.1"
 #define DEFAULT_PORT        3128
-#define MAX_CONN            2048
-#define MAX_EVENTS          2048
+#define MAX_CONN            4096
+#define MAX_EVENTS          4096
 #define BUF_SIZE            1024*10     /* 10k */
 #define POOL_MAX            26          /* 2^26 = 64M */
 #define HOST_MAX_LENGTH     128
+#define PAYLOAD_MAX_LENGTH  128
 #define DUMP_INTERVAL       30          /* seconds */
-#define FORMAT              "%-24s%-24s%-24s\n"
+#define FORMAT              "%-24s%-24s%-s\n"
 #define HEADER_FORMAT       "%-16s"FORMAT
 #define ITEM_FORMAT         "%-16u"FORMAT
-
+#define LOG_TIME_FORMAT     "%4d/%02d/%02d %02d:%02d:%02d"
+#define LOG_TIME_STR_LEN    sizeof("1970/09/28 12:00:00")
 #define LOG_DEBUG           1
 #define LOG_INFO            2
+#define EPOLL_PROXY_CLIENT  1
+#define EPOLL_PROXY_SERVER  2
+#define TO_CLIENT           1
+#define TO_SERVER           2
 
-#define MAX(a, b)   ((a) > (b) ? (a):(b))
 #define MIN(a, b)   ((a) < (b) ? (a):(b))
 
 static void log_core(const char *prompt, const char *format, ...);
 #define log_debug(...)  \
-    if (log_level <= LOG_DEBUG) log_core("debug", __VA_ARGS__)
+    if (proxy.log_level <= LOG_DEBUG) log_core("debug", __VA_ARGS__)
 #define log_info(...)  \
-    if (log_level <= LOG_INFO) log_core("info", __VA_ARGS__)
+    if (proxy.log_level <= LOG_INFO) log_core("info", __VA_ARGS__)
 
-#define log_error(s)  fprintf(stderr, "[+error] %s (%d) {%s}: %s %s\n",\
-        __FILE__, __LINE__, __FUNCTION__, s, strerror(errno))
+#define log_error(s)  fprintf(stderr, "%s [+error] %s:%d %s -- %s %s\n",\
+        cached_log_time, __FILE__, __LINE__, __FUNCTION__, s, strerror(errno))
 
 typedef struct conn {
     struct  sockaddr_in local;
@@ -61,6 +67,12 @@ typedef struct session {
     char   *request;
     ssize_t request_len;
 } session_t;
+
+typedef struct _epoll_data{
+    int fd;
+    int flag;
+    session_t *session;
+} epoll_data;
 
 KHASH_MAP_INIT_INT(32, session_t *);
 #define hash_t  khash_t(32)
@@ -79,7 +91,45 @@ typedef struct {
 } session_manager_t;
 
 
-static int log_level = 2;
+typedef struct {
+    char            addr[32];
+    unsigned int    port;
+    int             log_level;
+    int             is_dump;
+} proxy_t;
+
+
+void proxy_run(void);
+void proxy_init(void);
+void proxy_exit(void);
+int handle_accept_event(int);
+int handle_epollhup_event(int);
+int handle_epollin_event(epoll_data *);
+int handle_epollout_event(epoll_data *);
+int parse_http_request(session_t *, char *, size_t);
+int cache_http_request(mpool *, session_t *, char *, ssize_t);
+int sec_send(session_t *, int, char *, size_t);
+int put_session(hash_t *, session_t *);
+session_t *get_session(hash_t *, int);
+int del_session(hash_t *, int);
+session_t *create_session(mpool *, int);
+int close_session(session_t *, int);
+void dump_one_session(session_t *);
+void dump_session(hash_t *, const char *);
+static int open_listening_socket(const char *, unsigned int, int);
+static void epoll_ctl_add(int, epoll_data *, uint32_t);
+static void set_sockaddr(struct sockaddr_in *, const char *, unsigned int);
+static int set_nonblocking(int);
+static int new_connection(session_t *, int);
+static int close_socket(int, int);
+static int parse_host_field(char *, char *, unsigned int *);
+static char *sockaddr_to_str(struct sockaddr_in *);
+static void INT_handler(int);
+static void timer_handler(void);
+void print_hex_ascii_line(const u_char *, int, int);
+void print_payload(const u_char *, int);
+
+
 static char *not_found_response =
     "HTTP/1.1 404 Not Found\n"
     "Content-type: text/html\n" "\n"
@@ -89,35 +139,8 @@ static char *not_found_response =
     "  <p>The requested URL was not found on this server.</p>\n"
     " </body>\n" "</html>\n";
 
-void proxy_run(void);
-void proxy_init(void);
-void proxy_exit(void);
-int handle_accept_event(int);
-int handle_epollhup_event(int);
-int handle_epollin_event(int);
-int handle_epollout_event(int);
-int parse_http_request(session_t *, char *, size_t);
-int cache_http_request(mpool *, session_t *, char *, ssize_t);
-int forward_http_request(session_t *, char *, size_t);
-int forward_http_response(session_t *, char *, size_t);
-int put_session(hash_t *, session_t *);
-session_t *get_session(hash_t *, int);
-int del_session(hash_t *, int);
-session_t *create_session(mpool *, int);
-int close_session(session_t *, int);
-void dump_session(hash_t *, const char *);
-static void epoll_ctl_add(int, int, uint32_t);
-static void set_sockaddr(struct sockaddr_in *, const char *, unsigned int);
-static int setnonblocking(int);
-static int new_connection(session_t *, int);
-static int close_socket(int, int);
-static int hostname_to_ip(const char *, char *);
-static char *sockaddr_to_str(struct sockaddr_in *);
-static void INThandler(int);
-static void timer_handler(void);
-void print_hex_ascii_line(const u_char *, int, int);
-void print_payload(const u_char *, int);
-
+static char cached_log_time[LOG_TIME_STR_LEN];
+static proxy_t proxy;
 
 static session_manager_t sm = {
     .put    = put_session,
@@ -129,14 +152,88 @@ static session_manager_t sm = {
 };
 
 
+void show_help(char *cmd)
+{
+    fprintf(stderr, "Usage: %s [-?hvVd] [-s address] [-p port]\n"
+            "Options:\n"
+            " -?, -h    :print this help\n"
+            " -v        :print version number\n"
+            " -V        :verbose mode, dump session table\n"
+            " -d        :enable debug mode\n"
+            " -s        :proxy listening address\n"
+            " -p        :proxy listening port\n"
+            , cmd);
+}
+
+
+void get_options(int argc, char *argv[])
+{
+    int     i;
+    u_char *p;
+
+    for (i = 1; i < argc; i++) {
+        p = (u_char *) argv[i];
+
+        if (*p++ != '-') {
+            fprintf(stderr, "invalid options \"%s\"\n", argv[i]);
+            exit(1);
+        }
+
+        while (*p) {
+            switch (*p++) {
+                case '?':
+                case 'h':
+                    show_help(argv[0]);
+                    exit(0);
+                    break;
+                case 'v':
+                    fprintf(stderr, "%s %s\n", argv[0], VERSION);
+                    exit(0);
+                    break;
+                case 'V':
+                    proxy.is_dump = 1;
+                    break;
+                case 'd':
+                    proxy.log_level = LOG_DEBUG;
+                    break;
+                case 's':
+                    if (*p && strlen((char *) p) < 32) {
+                        strcpy(proxy.addr, (char *) p);
+                    } else if (argv[++i] && strlen(argv[i]) < 32) {
+                        strcpy(proxy.addr, argv[i]);
+                    } else {
+                        fprintf(stderr, "invalid option: %s\n", argv[i]);
+                        exit(0);
+                    }
+                    break;
+                case 'p':
+                    if (*p) {
+                        proxy.port = atoi((char *) p);
+                    } else if (argv[++i]) {
+                        proxy.port = atoi(argv[i]);
+                    } else {
+                        fprintf(stderr, "invalid option: %s\n", argv[i]);
+                        exit(0);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+
+
 int main(int argc, char *argv[])
 {
+    proxy_init();
+    get_options(argc, argv);
+
     if (signal(SIGINT, SIG_IGN) != SIG_IGN) {
-        signal(SIGINT, INThandler);
+        signal(SIGINT, INT_handler);
     }
     signal(SIGPIPE, SIG_IGN);
 
-    proxy_init();
     proxy_run();
     return 0;
 }
@@ -144,6 +241,11 @@ int main(int argc, char *argv[])
 
 void proxy_init(void)
 {
+    strcpy(proxy.addr, DEFAULT_ADDR);
+    proxy.port = DEFAULT_PORT;
+    proxy.log_level = LOG_INFO;
+    proxy.is_dump = 0;
+
     sm.epfd = epoll_create(1);
     sm.pool = mpool_init(10, POOL_MAX);
     sm.h = kh_init(32);
@@ -156,64 +258,54 @@ void proxy_run(void)
     int                 i;
     int                 nfds;
     int                 listen_sock;
-    struct sockaddr_in  srv_addr;
+    epoll_data          ed;
+    epoll_data         *edp;
     struct epoll_event  events[MAX_EVENTS];
 
-    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR,
-                   &(int) {1}, sizeof(int)) < 0)
-    {
-        log_error("setsockopt(SO_REUSEADDR)");
-    }
-
-    set_sockaddr(&srv_addr, DEFAULT_ADDR, DEFAULT_PORT);
-    if (bind(listen_sock, (struct sockaddr *)&srv_addr,
-             sizeof(srv_addr)) < 0)
-    {
-        log_error("bind()");
+    listen_sock = open_listening_socket(proxy.addr, proxy.port, MAX_CONN);
+    if (listen_sock == -1) {
         exit(1);
     }
-
-    log_info("listen on %s:%d \n", DEFAULT_ADDR, DEFAULT_PORT);
-    setnonblocking(listen_sock);
-    listen(listen_sock, MAX_CONN);
-
-    epoll_ctl_add(sm.epfd, listen_sock, EPOLLIN | EPOLLET);
+    ed.fd = listen_sock;
+    epoll_ctl_add(sm.epfd, &ed, EPOLLIN | EPOLLET);
 
     for (;;) {
         nfds = epoll_wait(sm.epfd, events, MAX_EVENTS, -1);
+
+        /* hook function, such as dump session */
+        timer_handler();
+
+        log_debug("epoll_wait return: %d\n", nfds);
         if (nfds == -1) {
             log_error("epoll_wait()");
             continue;
         }
-        log_debug("epoll_wait return: %d\n", nfds);
+
         for (i = 0; i < nfds; i++) {
+            edp = events[i].data.ptr;
 
-            timer_handler();
-
-            if (events[i].data.fd == listen_sock) {
+            if (edp->fd == listen_sock) {
                 handle_accept_event(listen_sock);
                 continue;
             }
 
             if (events[i].events & EPOLLIN) {
-                handle_epollin_event(events[i].data.fd);
-                continue;
+                handle_epollin_event(edp);
             }
 
             if (events[i].events & EPOLLOUT) {
-                handle_epollout_event(events[i].data.fd);
-                continue;
+                handle_epollout_event(edp);
             }
 
             if (events[i].events & EPOLLERR) {
-                log_error("EPOLLERR:");
-                continue;
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    log_error("EPOLLERR:");
+                }
             }
 
             /* check if the connection is closing */
             if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
-                handle_epollhup_event(events[i].data.fd);
+                handle_epollhup_event(edp->fd);
             }
         }
     }
@@ -231,20 +323,31 @@ void proxy_exit(void)
 /*
  * accept new connection from client
  */
-int handle_accept_event(int fd)
+int handle_accept_event(int listen_sock)
 {
     int                 conn_sock;
     socklen_t           len;
+    epoll_data         *ed;
     struct sockaddr_in  cli_addr;
 
     len = sizeof(struct sockaddr_in);
-    conn_sock = accept(fd, (struct sockaddr *)&cli_addr, &len);
+    conn_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &len);
+    if (conn_sock == -1) {
+        log_error("accept()");
+        return -1;
+    }
 
-    log_debug("connected with %s\n", sockaddr_to_str(&cli_addr));
+    set_nonblocking(conn_sock);
 
-    setnonblocking(conn_sock);
-    epoll_ctl_add(sm.epfd, conn_sock, EPOLLIN | EPOLLOUT |
+    ed = (epoll_data *) mpool_alloc(sm.pool, sizeof(epoll_data));
+    ed->fd = conn_sock;
+    ed->flag = EPOLL_PROXY_CLIENT;
+    ed->session = NULL;
+    epoll_ctl_add(sm.epfd, ed, EPOLLIN | EPOLLOUT |
                   EPOLLET | EPOLLRDHUP | EPOLLHUP);
+
+    log_info("accept connection from %s\n", sockaddr_to_str(&cli_addr));
+
     return 0;
 }
 
@@ -254,7 +357,7 @@ int handle_accept_event(int fd)
  */
 int handle_epollhup_event(int fd)
 {
-    log_debug("enter %s ---\n", __FUNCTION__);
+    log_debug("enter %s\n", __FUNCTION__);
 
     session_t *session = sm.get(sm.h, fd);
     if (session != NULL) {
@@ -262,7 +365,7 @@ int handle_epollhup_event(int fd)
         sm.del(sm.h, session->conn_ps.sock);
     } else {
         log_debug("do not find any session in cache \n");
-        close_socket(fd, sm.epfd);
+        //close_socket(fd, sm.epfd);
     }
     return 0;
 }
@@ -270,34 +373,72 @@ int handle_epollhup_event(int fd)
 
 /*
  * receive http request from client and http response from server
- * @fd: connected socket
- * @epfd: epoll fd
  */
-int handle_epollin_event(int fd)
+int handle_epollin_event(epoll_data *edp)
 {
     int         ret;
     char        buf[BUF_SIZE];
     ssize_t     bytes_read;
     session_t  *session;
 
+    log_debug("enter %s\n", __FUNCTION__);
+
     for (;;) {
         bzero(buf, sizeof(buf));
-        bytes_read = read(fd, buf, sizeof(buf));
-        if (bytes_read <= 0) {
-            if (bytes_read == 0) {    /* read done, shutdown(fd, SHUT_RD); */
+        bytes_read = recv(edp->fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (bytes_read == 0) {
+            break;
+        }
+        if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
             }
-            if (bytes_read < 0 && errno != EAGAIN) {
-                log_error("read()");
-                session = sm.get(sm.h, fd);
-                sm.close(session, sm.epfd);
-                sm.del(sm.h, session->conn_ps.sock);
+            log_error("recv()");
+
+            switch (errno) {
+            case EBADF:
+            case EPIPE:
+            case ECONNRESET:
+                if ((session = edp->session)) {
+                    sm.close(session, sm.epfd);
+                    sm.del(sm.h, session->conn_ps.sock);
+                }
+                break;
+            default:
+                ;
             }
             break;
         }
 
-        session = sm.get(sm.h, fd);
-        if (session == NULL) {
-            session = sm.create(sm.pool, fd);
+        /*
+         * check fd is sock_pc or sock_ps
+         * namely, read data from client or server
+         */
+
+        if (edp->flag == EPOLL_PROXY_SERVER) {
+            session = sm.get(sm.h, edp->fd);
+            if (session) {
+                ret = sec_send(session, TO_CLIENT, buf, bytes_read);
+                if (ret < 0) {
+                    break;
+                }
+            } else {
+                log_error("unexpected error");
+            }
+        } else if (edp->flag == EPOLL_PROXY_CLIENT) {
+            /*
+             * check if there exists session for the client
+             * maybe keepalive, reuse the old connection
+             */
+            if (edp->session) {
+                ret = sec_send(edp->session, TO_SERVER, buf, bytes_read);
+                if (ret < 0) {
+                    break;
+                }
+                break;
+            }
+
+            session = sm.create(sm.pool, edp->fd);
             if (session == NULL) {
                 goto proxy_request_error;
             }
@@ -311,24 +452,24 @@ int handle_epollin_event(int fd)
             } else if (ret == 1) {
                 /* connection is still in progress */
                 cache_http_request(sm.pool, session, buf, bytes_read);
-                put_session(sm.hc, session);
+                sm.put(sm.hc, session);
             } else {
-                forward_http_request(session, buf, bytes_read);
-                put_session(sm.h, session);
+                ret = sec_send(session, TO_SERVER, buf, bytes_read);
+                if (ret < 0) {
+                    break;
+                }
+                sm.put(sm.h, session);
             }
             continue;
 
-         proxy_request_error:
-            print_payload((u_char *) buf, MIN(bytes_read, 128));
-            ret = write(fd, not_found_response, strlen(not_found_response));
-        } else {
-            log_debug("received {%zd} bytes data from %s\n",
-                      bytes_read, sockaddr_to_str(&(session->conn_ps.remote)));
-            if (forward_http_response(session, buf, bytes_read) < 0) {
-                break;
-            }
+        proxy_request_error:
+            log_error("proxy_request_error");
+            print_payload((u_char *) buf, MIN(bytes_read, PAYLOAD_MAX_LENGTH));
+            ret = write(edp->fd, not_found_response, strlen(not_found_response));
+            break;
         }
     }
+
     return 0;
 }
 
@@ -336,21 +477,25 @@ int handle_epollin_event(int fd)
 /*
  * mainly handle these async connect event
  */
-int handle_epollout_event(int fd)
+int handle_epollout_event(epoll_data *edp)
 {
-    log_debug("enter %s ---\n", __FUNCTION__);
     session_t   *s;
 
-    s = sm.get(sm.hc, fd);
-    if (s != NULL) {
+    log_debug("enter %s\n", __FUNCTION__);
+
+    s = sm.get(sm.hc, edp->fd);
+    if (edp->flag == EPOLL_PROXY_SERVER && s != NULL) {
         sm.put(sm.h, s);
-        sm.del(sm.hc, fd);
-        if (forward_http_request(s, s->request, s->request_len) < 0) {
-            print_payload((u_char *) s->request, s->request_len);
-            return write(fd, not_found_response, strlen(not_found_response));
+        sm.del(sm.hc, edp->fd);
+        if (sec_send(s, TO_SERVER, s->request, s->request_len) < 0) {
+            log_error("sec_send");
+            print_payload((u_char *) s->request,
+                          MIN(s->request_len, PAYLOAD_MAX_LENGTH));
+            return sec_send(s, TO_CLIENT, not_found_response,
+                            strlen(not_found_response));
         }
     } else {
-        log_debug("%s: get_session fail ---\n", __FUNCTION__);
+        log_debug("%s: get_session fail\n", __FUNCTION__);
     }
     return 0;
 }
@@ -400,50 +545,89 @@ int cache_http_request(mpool *pool, session_t *s,
 }
 
 
-int forward_http_request(session_t *session, char *buf, size_t buflen)
+int sec_send(session_t *s, int direction, char *buf, size_t len)
 {
     ssize_t    nw;
 
-    nw = write(session->conn_ps.sock, buf, buflen);
-    if (nw < 0 && errno != EAGAIN) {
-        log_error("write()");
-        sm.close(session, sm.epfd);
-        sm.del(sm.h, session->conn_ps.sock);
-        return nw;
+    if (direction == TO_CLIENT) {
+        nw = send(s->conn_pc.sock, buf, len, MSG_NOSIGNAL);
+    } else if (direction == TO_SERVER) {
+        nw = send(s->conn_ps.sock, buf, len, MSG_NOSIGNAL);
+    } else {
+        log_error("unexpected direction");
+        return -1;
     }
 
+    if (nw == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        log_error("send()");
+        dump_one_session(s);
+        print_payload((u_char *) buf, MIN(len, PAYLOAD_MAX_LENGTH));
+
+        switch (errno) {
+        case EBADF:
+        case EPIPE:
+        case ECONNRESET:
+            sm.close(s, sm.epfd);
+            sm.del(sm.h, s->conn_ps.sock);
+            break;
+        default:
+            ;
+        }
+        return -1;
+    }
     return 0;
 }
 
 
-int forward_http_response(session_t *session, char *buf, size_t buflen)
+static int open_listening_socket(const char *addr, unsigned int port, int max_conn)
 {
-    ssize_t    nw;
+    int                 sock;
+    struct sockaddr_in  srv_addr;
 
-    nw = write(session->conn_pc.sock, buf, buflen);
-    log_debug("writing {%zd} bytes data to %s\n", nw,
-              sockaddr_to_str(&session->conn_pc.remote));
-    if (nw == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        log_error("write()");
-        print_payload((u_char *) buf, MIN(buflen, 128));
-        sm.close(session, sm.epfd);
-        sm.del(sm.h, session->conn_ps.sock);
-        return nw;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        log_error("scoket()");
+        return -1;
     }
 
-    return 0;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                   &(int) {1}, sizeof(int)) < 0)
+    {
+        log_error("setsockopt(SO_REUSEADDR)");
+        return -1;
+    }
+
+    set_sockaddr(&srv_addr, addr, port);
+    if (bind(sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
+        log_error("bind()");
+        return -1;
+    }
+
+    if (set_nonblocking(sock) < 0) {
+        log_error("set_nonblocking()");
+        return -1;
+    }
+
+    if (listen(sock, max_conn) < 0) {
+        log_error("listen()");
+        return -1;
+    }
+
+    log_info("listen on %s:%d \n", addr, port);
+
+    return sock;
 }
 
 
 /*
  * register events of fd to epfd
  */
-static void epoll_ctl_add(int epfd, int fd, uint32_t events)
+static void epoll_ctl_add(int epfd, epoll_data *data, uint32_t events)
 {
     struct epoll_event ev;
     ev.events = events | EPOLLERR;
-    ev.data.fd = fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+    ev.data.ptr = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, data->fd, &ev) == -1) {
         log_error("epoll_ctl()");
         exit(1);
     }
@@ -460,7 +644,7 @@ static void set_sockaddr(struct sockaddr_in *addr, const char *ipaddr,
 }
 
 
-static int setnonblocking(int sockfd)
+static int set_nonblocking(int sockfd)
 {
     if (fcntl(sockfd, F_SETFL,
               fcntl(sockfd, F_GETFD, 0) | O_NONBLOCK) == -1)
@@ -473,78 +657,80 @@ static int setnonblocking(int sockfd)
 
 /*
  * create new connection between proxy and remote server
- * ret == -1: connect error
- * ret == 0: connect success
- * ret == 1: connect attempt is in progress
+ * return value:
+ *      -1: connect error
+ *      0: connect success
+ *      1: connect attempt is in progress
  */
 static int new_connection(session_t *session, int epfd)
 {
-    int                 ret;
+    int                 connect_flag;
     int                 sockfd;
-    unsigned int        port;
     char                ip[16];
-    char               *p;
+    socklen_t           len;
+    epoll_data         *ed;
+    unsigned int        port;
     struct sockaddr_in  srv_addr;
-    socklen_t           len = sizeof(struct sockaddr_in);
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        log_error("socket()");
+        goto error;
+    }
+
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
                    &(int) {1}, sizeof(int)) < 0)
     {
         log_error("setsockopt(SO_REUSEADDR)");
+        goto error;
     }
 
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY,
                    &(int) {1}, sizeof(int)) < 0)
     {
         log_error("setsockopt(TCP_NODELAY)");
-    }
-    /* set non-block and add to epoll */
-    setnonblocking(sockfd);
-    epoll_ctl_add(epfd, sockfd, EPOLLIN | EPOLLOUT |
-                  EPOLLET | EPOLLRDHUP | EPOLLHUP);
-
-    /*
-     * host: ip address or domain name (with port number)
-     * such as: 1.2.3.4, 1.2.3.4:8080, www.google.com
-     */
-    for (p = session->host; *p && *p != ':'; p++) ;
-
-    if (*p != 0) {
-        port = atoi(p);
-        *p = 0;
-    } else {
-        port = 80;
+        goto error;
     }
 
-    if (hostname_to_ip(session->host, ip) < 0) {
+    if (set_nonblocking(sockfd) < 0) {
+        log_error("set_nonblocking()");
+        goto error;
+    }
+
+    if (parse_host_field(session->host, ip, &port) < 0) {
         goto error;
     }
 
     set_sockaddr(&srv_addr, ip, port);
-
-    log_debug("%s: client=%s ===\n", __FUNCTION__,
-              sockaddr_to_str(&session->conn_pc.remote));
-    log_debug("%s: server=%s(%s) ===\n", __FUNCTION__,
-              session->host, sockaddr_to_str(&srv_addr));
-
-    ret = connect(sockfd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
-    if (ret < 0 && errno != EINPROGRESS) {
+    connect_flag = connect(sockfd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+    if (connect_flag < 0 && errno != EINPROGRESS) {
         log_error("connect()");
         goto error;
     }
 
     session->conn_ps.sock = sockfd;
     session->conn_ps.remote = srv_addr;
+    len = sizeof(struct sockaddr_in);
     if (getsockname(sockfd, (struct sockaddr *)&session->conn_ps.local, &len)
         == -1) {
         log_error("getsockname()");
         goto error;
     }
-    return (ret == 0 ? 0 : 1);
+
+    ed = (epoll_data *) mpool_alloc(sm.pool, sizeof(epoll_data));
+    ed->fd = sockfd;
+    ed->flag = EPOLL_PROXY_SERVER;
+    ed->session = session;
+    epoll_ctl_add(epfd, ed, EPOLLIN | EPOLLOUT |
+                  EPOLLET | EPOLLRDHUP | EPOLLHUP);
+
+    log_debug("client: %s === server: %s\n",
+              sockaddr_to_str(&session->conn_pc.remote), session->host);
+
+    return (connect_flag == 0 ? 0 : 1);
 
  error:
-    close_socket(sockfd, epfd);
+    close(sockfd);
     return -1;
 }
 
@@ -565,12 +751,16 @@ int put_session(hash_t *h, session_t *s)
     khint_t     k;
 
     k = kh_put(32, h, s->conn_ps.sock, &ret);
-    if (!ret) {
+    if (ret == -1) {
         log_info("kh_put error, sockfd=%d, ret=%d\n",
                  s->conn_ps.sock, ret);
         return -1;
-        //close_session((session_t *) kh_val(h, k), epfd, h);
-        //kh_del(32, h, s->conn_ps.sock);
+    }
+    if (ret == 0 && k < kh_end(h)) {
+        log_info("key conflict, following two line are new and old:\n");
+        dump_one_session(s);
+        dump_one_session((session_t *) kh_val(h, k));
+        //return -1;
     }
     kh_val(h, k) = s;
     return 0;
@@ -614,6 +804,7 @@ session_t *create_session(mpool *pool, int sockfd)
         return NULL;
     }
 
+    bzero((u_char *)s, sizeof(session_t));
     s->conn_pc.sock = sockfd;
 
     if (getsockname(sockfd, (struct sockaddr *)&s->conn_pc.local, &len)
@@ -650,45 +841,58 @@ int close_session(session_t *s, int epfd)
 }
 
 
+void dump_one_session(session_t *s)
+{
+    char    buf[32];
+
+    strcpy(buf, sockaddr_to_str(&s->conn_pc.remote));
+    printf(ITEM_FORMAT, s->conn_ps.sock, buf,
+           sockaddr_to_str(&s->conn_ps.local), s->host);
+}
+
+
 void dump_session(hash_t *table, const char *table_name)
 {
-    char        buf[32];
     khint_t     k;
-    session_t  *s;
 
     if (kh_size(table) == 0){
         log_info("%s session table is empty\n", table_name);
         return;
     }
 
-    log_info("+------------------------dump_session"
-             " %s--------------------+\n", table_name);
-    log_info(HEADER_FORMAT, "key", "client", "proxy", "server");
+    printf("+------------------------dump_session"
+           " %s size:%d--------------------+\n", table_name, kh_size(table));
+    printf(HEADER_FORMAT, "key", "client", "proxy", "server");
 
     for (k = kh_begin(table); k != kh_end(table); k++) {
         if (kh_exist(table, k)) {
-            s = (session_t *) kh_val(table, k);
-            strcpy(buf, sockaddr_to_str(&s->conn_pc.remote));
-            log_info(ITEM_FORMAT, k, buf,
-                     sockaddr_to_str(&s->conn_ps.local), s->host);
+            dump_one_session((session_t *) kh_val(table, k));
         }
     }
 }
 
 
 /*
- * get ip from domain name
- * @hostname: input argument, such as: www.google.com
- * @ip: output argument, such as: 1.2.3.4
+ * parse host field in http request header to get ip and port
  */
-static int hostname_to_ip(const char *hostname, char *ip)
+static int parse_host_field(char *hostname, char *ip, unsigned int *port)
 {
     int                 i;
+    char               *p;
     struct hostent     *he;
     struct in_addr    **addr_list;
 
+    for (p = hostname; *p && *p != ':'; p++) ;
+
+    if (*p != 0) {
+        *port = atoi(p);
+        *p = 0;
+    } else {
+        *port = 80;
+    }
+
     if ((he = gethostbyname(hostname)) == NULL) {
-        log_debug("gethostbyname('%s') error\n", hostname);
+        log_error("gethostbyname()");
         return -1;
     }
 
@@ -719,7 +923,7 @@ static void log_core(const char *prompt, const char *format, ...)
 {
     va_list argList;
     va_start(argList, format);
-    printf("[+%s] -- ", prompt);
+    printf("%s [+%s] ", cached_log_time, prompt);
     vprintf(format, argList);
     va_end(argList);
 }
@@ -728,7 +932,7 @@ static void log_core(const char *prompt, const char *format, ...)
 /*
  * handle Ctrl-C signal
  */
-static void INThandler(int sig)
+static void INT_handler(int sig)
 {
     char c;
     signal(sig, SIG_IGN);
@@ -739,7 +943,7 @@ static void INThandler(int sig)
         proxy_exit();
         exit(0);
     } else {
-        signal(SIGINT, INThandler);
+        signal(SIGINT, INT_handler);
     }
 }
 
@@ -748,11 +952,17 @@ static void timer_handler(void)
 {
     static time_t   last_time;
     time_t          now = time(NULL);
+    struct tm      *tm;
 
-    if (difftime(now, last_time) >= DUMP_INTERVAL) {
+    tm = localtime(&now);
+    sprintf(cached_log_time, LOG_TIME_FORMAT,
+            tm->tm_year + 1900, tm->tm_mon, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+    if (proxy.is_dump == 1 && difftime(now, last_time) >= DUMP_INTERVAL) {
         last_time = now;
-        dump_session(sm.h, "established");
-        dump_session(sm.hc, "connecting");
+        sm.dump(sm.h, "established");
+        sm.dump(sm.hc, "connecting");
     }
 }
 

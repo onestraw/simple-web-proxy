@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-O -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror -g
+CFLAGS=-Os -W -Wall -Wpointer-arith -Wno-unused-parameter -Werror
 SRC=src
 DEPS=$(wildcard $(SRC)/*.h)
 BINDIR=objs
@@ -9,6 +9,9 @@ OBJS=$(patsubst %.c,$(BINDIR)/%.o,$(wildcard $(SRC)/*.c))
 VPATH=$(SRC)
 
 all: $(OBJDIR) $(TARGET) 
+
+debug: CFLAGS+= -O0 -g
+debug: $(OBJDIR) $(TARGET)
 
 $(TARGET): $(OBJS)
 	gcc -o $@ $^ $(CFLAGS)
