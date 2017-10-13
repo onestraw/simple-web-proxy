@@ -330,23 +330,29 @@ int handle_accept_event(int listen_sock)
     epoll_data         *ed;
     struct sockaddr_in  cli_addr;
 
-    len = sizeof(struct sockaddr_in);
-    conn_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &len);
-    if (conn_sock == -1) {
-        log_error("accept()");
-        return -1;
+    /* one or more incoming connection */
+    while (1) {
+        len = sizeof(struct sockaddr_in);
+        conn_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &len);
+        if (conn_sock == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            log_error("accept()");
+            return -1;
+        }
+
+        set_nonblocking(conn_sock);
+
+        ed = (epoll_data *) mpool_alloc(sm.pool, sizeof(epoll_data));
+        ed->fd = conn_sock;
+        ed->flag = EPOLL_PROXY_CLIENT;
+        ed->session = NULL;
+        epoll_ctl_add(sm.epfd, ed, EPOLLIN | EPOLLOUT |
+                      EPOLLET | EPOLLRDHUP | EPOLLHUP);
+
+        log_info("accept connection from %s\n", sockaddr_to_str(&cli_addr));
     }
-
-    set_nonblocking(conn_sock);
-
-    ed = (epoll_data *) mpool_alloc(sm.pool, sizeof(epoll_data));
-    ed->fd = conn_sock;
-    ed->flag = EPOLL_PROXY_CLIENT;
-    ed->session = NULL;
-    epoll_ctl_add(sm.epfd, ed, EPOLLIN | EPOLLOUT |
-                  EPOLLET | EPOLLRDHUP | EPOLLHUP);
-
-    log_info("accept connection from %s\n", sockaddr_to_str(&cli_addr));
 
     return 0;
 }
@@ -378,99 +384,88 @@ int handle_epollin_event(epoll_data *edp)
 {
     int         ret;
     char        buf[BUF_SIZE];
+    ssize_t     nread;
     ssize_t     bytes_read;
     session_t  *session;
 
     log_debug("enter %s\n", __FUNCTION__);
 
-    for (;;) {
-        bzero(buf, sizeof(buf));
-        bytes_read = recv(edp->fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (bytes_read == 0) {
-            break;
-        }
-        if (bytes_read < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
+    bzero(buf, sizeof(buf));
+    bytes_read = 0;
+
+    while ((nread = recv(edp->fd, buf + bytes_read, BUF_SIZE - bytes_read, MSG_DONTWAIT)) > 0) {
+        bytes_read += nread;
+    }
+
+    if (nread == -1) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
             log_error("recv()");
-
-            switch (errno) {
-            case EBADF:
-            case EPIPE:
-            case ECONNRESET:
-                if ((session = edp->session)) {
-                    sm.close(session, sm.epfd);
-                    sm.del(sm.h, session->conn_ps.sock);
-                }
-                break;
-            default:
-                ;
+            /* EBADF, EPIPE, ECONNRESET */
+            if ((session = edp->session)) {
+                sm.close(session, sm.epfd);
+                sm.del(sm.h, session->conn_ps.sock);
             }
-            break;
+        }
+    }
+
+    /*
+     * the fd is proxy-server, forward the buf to client
+     */
+    if (edp->flag == EPOLL_PROXY_SERVER) {
+        session = sm.get(sm.h, edp->fd);
+        if (session) {
+            ret = sec_send(session, TO_CLIENT, buf, bytes_read);
+            if (ret < 0) {
+                return -1;
+            }
+        } else {
+            log_error("unexpected error");
+        }
+    } else if (edp->flag == EPOLL_PROXY_CLIENT) {
+        /*
+         * check if there exists session for the client
+         * maybe keepalive, reuse the old connection
+         */
+        if (edp->session) {
+            return sec_send(edp->session, TO_SERVER, buf, bytes_read);
         }
 
-        /*
-         * check fd is sock_pc or sock_ps
-         * namely, read data from client or server
-         */
+        session = sm.create(sm.pool, edp->fd);
+        if (session == NULL) {
+            goto proxy_request_error;
+        }
 
-        if (edp->flag == EPOLL_PROXY_SERVER) {
-            session = sm.get(sm.h, edp->fd);
-            if (session) {
-                ret = sec_send(session, TO_CLIENT, buf, bytes_read);
-                if (ret < 0) {
-                    break;
-                }
-            } else {
-                log_error("unexpected error");
-            }
-        } else if (edp->flag == EPOLL_PROXY_CLIENT) {
-            /*
-             * check if there exists session for the client
-             * maybe keepalive, reuse the old connection
-             */
-            if (edp->session) {
-                ret = sec_send(edp->session, TO_SERVER, buf, bytes_read);
-                if (ret < 0) {
-                    break;
-                }
-                break;
-            }
+        if (parse_http_request(session, buf, bytes_read) < 0) {
+            goto proxy_request_error;
+        }
 
-            session = sm.create(sm.pool, edp->fd);
-            if (session == NULL) {
+        if ((ret = new_connection(session, sm.epfd)) < 0) {
+            goto proxy_request_error;
+        } else if (ret == 1) {
+            /* connection is still in progress */
+            cache_http_request(sm.pool, session, buf, bytes_read);
+            sm.put(sm.hc, session);
+        } else {
+            /* connection is ready */
+            sm.put(sm.h, session);
+            ret = sec_send(session, TO_SERVER, buf, bytes_read);
+            if (ret < 0) {
                 goto proxy_request_error;
             }
-
-            if (parse_http_request(session, buf, bytes_read) < 0) {
-                goto proxy_request_error;
-            }
-
-            if ((ret = new_connection(session, sm.epfd)) < 0) {
-                goto proxy_request_error;
-            } else if (ret == 1) {
-                /* connection is still in progress */
-                cache_http_request(sm.pool, session, buf, bytes_read);
-                sm.put(sm.hc, session);
-            } else {
-                ret = sec_send(session, TO_SERVER, buf, bytes_read);
-                if (ret < 0) {
-                    break;
-                }
-                sm.put(sm.h, session);
-            }
-            continue;
-
-        proxy_request_error:
-            log_error("proxy_request_error");
-            print_payload((u_char *) buf, MIN(bytes_read, PAYLOAD_MAX_LENGTH));
-            ret = write(edp->fd, not_found_response, strlen(not_found_response));
-            break;
         }
     }
 
     return 0;
+
+proxy_request_error:
+    log_error("proxy_request_error");
+    print_payload((u_char *) buf, MIN(bytes_read, PAYLOAD_MAX_LENGTH));
+    ret = write(edp->fd, not_found_response, strlen(not_found_response));
+    if (session) {
+        sm.close(session, sm.epfd);
+        sm.del(sm.h, session->conn_ps.sock);
+    }
+    return -1;
 }
 
 
@@ -547,34 +542,38 @@ int cache_http_request(mpool *pool, session_t *s,
 
 int sec_send(session_t *s, int direction, char *buf, size_t len)
 {
+    int        sk;
     ssize_t    nw;
+    ssize_t    bytes_send;
 
-    if (direction == TO_CLIENT) {
-        nw = send(s->conn_pc.sock, buf, len, MSG_NOSIGNAL);
-    } else if (direction == TO_SERVER) {
-        nw = send(s->conn_ps.sock, buf, len, MSG_NOSIGNAL);
-    } else {
+    if (direction != TO_CLIENT && direction != TO_SERVER) {
         log_error("unexpected direction");
         return -1;
     }
 
-    if (nw == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    if (direction == TO_CLIENT) {
+        sk = s->conn_pc.sock;
+    } else {
+        sk = s->conn_ps.sock;
+    }
+
+    bytes_send = 0;
+
+    while ((nw = send(sk, buf + bytes_send, len - bytes_send, MSG_NOSIGNAL)) > 0) {
+        bytes_send += nw;
+    }
+
+    if (nw == -1 && errno != EAGAIN) {
         log_error("send()");
         dump_one_session(s);
         print_payload((u_char *) buf, MIN(len, PAYLOAD_MAX_LENGTH));
+        /* EBADF, EPIPE, ECONNRESET */
+        sm.close(s, sm.epfd);
+        sm.del(sm.h, s->conn_ps.sock);
 
-        switch (errno) {
-        case EBADF:
-        case EPIPE:
-        case ECONNRESET:
-            sm.close(s, sm.epfd);
-            sm.del(sm.h, s->conn_ps.sock);
-            break;
-        default:
-            ;
-        }
         return -1;
     }
+
     return 0;
 }
 
@@ -647,7 +646,7 @@ static void set_sockaddr(struct sockaddr_in *addr, const char *ipaddr,
 static int set_nonblocking(int sockfd)
 {
     if (fcntl(sockfd, F_SETFL,
-              fcntl(sockfd, F_GETFD, 0) | O_NONBLOCK) == -1)
+              fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK) == -1)
     {
         return -1;
     }
@@ -727,7 +726,7 @@ static int new_connection(session_t *session, int epfd)
     log_debug("client: %s === server: %s\n",
               sockaddr_to_str(&session->conn_pc.remote), session->host);
 
-    return (connect_flag == 0 ? 0 : 1);
+    return (errno == EINPROGRESS ? 1 : 0);
 
  error:
     close(sockfd);
@@ -892,7 +891,7 @@ static int parse_host_field(char *hostname, char *ip, unsigned int *port)
     }
 
     if ((he = gethostbyname(hostname)) == NULL) {
-        log_error("gethostbyname()");
+        log_debug("gethostbyname(%s)", hostname);
         return -1;
     }
 
