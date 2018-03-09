@@ -5,19 +5,27 @@ A simple http proxy at the clent side.
 
 # workflow of web proxy
 
-    CLIENT --- (1)http request ---> PROXY --- (2)http request ---> SERVER
-    CLIENT <-- (4)http response --- PROXY <-- (3)http response --- SERVER
-    
-    +--------+                            +-------+                           +--------+
-    |        | -- (1)TCP connection ----> |       |                           |        |
-    |        | -- (2)http request ------> |       | --- (3)TCP connection --> |        |
-    |        |                            |       | --- (4)http request ----> |        |
-    | CLIENT |                            | PROXY |                           | SERVER |
-    |        | <- (6)http response ------ |       | <-- (5)http response ---  |        |
-    |        |         ...                |       |          ...              |        |
-    |        |                            |       |                           |        |
-    |        | <- (n+1)close connection - |       | <-- (n)close connection - |        |
-    +--------+                            +-------+                           +--------+
+                                         +--------+
+                                         |        |
+                                         |  DNS   |
+                                         | SERVER |
+                                         |        |
+                                         +--------+
+                                              ^
+                                              |
+                                             (3) resolve the host name
+                                              |
+                                              v
+    +--------+                            +-------+                            +--------+
+    |        | -- (1)TCP connection ----> |       |                            |        |
+    |        | -- (2)http request ------> |       | --- (4)TCP connection ---> |        |
+    |        |                            |       | --- (5)http request -----> |        |
+    | CLIENT |                            | PROXY |                            | SERVER |
+    |        | <- (7)http response ------ |       | <-- (6)http response ----- |        |
+    |        |         ...                |       |          ...               |        |
+    |        |                            |       |                            |        |
+    |        | -- (n)close connection --> |       | - (n+1)close connection -> |        |
+    +--------+                            +-------+                            +--------+
 
 
 # key point
