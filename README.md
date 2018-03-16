@@ -1,4 +1,4 @@
-# vProxy
+# webproxy [![Build Status](https://travis-ci.org/onestraw/simple-web-proxy.svg?branch=master)](https://travis-ci.org/onestraw/simple-web-proxy)
 
 A simple http proxy at the clent side.
 
