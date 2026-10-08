@@ -141,6 +141,7 @@ static char *not_found_response =
 
 static char cached_log_time[LOG_TIME_STR_LEN];
 static proxy_t proxy;
+static volatile sig_atomic_t shutdown_requested = 0;
 
 static session_manager_t sm = {
     .put    = put_session,
@@ -270,6 +271,12 @@ void proxy_run(void)
     epoll_ctl_add(sm.epfd, &ed, EPOLLIN | EPOLLET);
 
     for (;;) {
+        /* check for shutdown request (set by signal handler) */
+        if (shutdown_requested) {
+            log_info("Shutdown requested, exiting.\n");
+            break;
+        }
+
         nfds = epoll_wait(sm.epfd, events, MAX_EVENTS, -1);
 
         /* hook function, such as dump session */
@@ -368,7 +375,9 @@ int handle_epollhup_event(int fd)
     session_t *session = sm.get(sm.h, fd);
     if (session != NULL) {
         sm.close(session, sm.epfd);
-        sm.del(sm.h, session->conn_ps.sock);
+        if (session->conn_ps.sock >= 0) {
+            sm.del(sm.h, session->conn_ps.sock);
+        }
     } else {
         log_debug("do not find any session in cache \n");
         //close_socket(fd, sm.epfd);
@@ -403,7 +412,9 @@ int handle_epollin_event(epoll_data *edp)
             /* EBADF, EPIPE, ECONNRESET */
             if ((session = edp->session)) {
                 sm.close(session, sm.epfd);
-                sm.del(sm.h, session->conn_ps.sock);
+                if (session->conn_ps.sock >= 0) {
+                    sm.del(sm.h, session->conn_ps.sock);
+                }
             }
         }
     }
@@ -463,7 +474,9 @@ proxy_request_error:
     ret = write(edp->fd, not_found_response, strlen(not_found_response));
     if (session) {
         sm.close(session, sm.epfd);
-        sm.del(sm.h, session->conn_ps.sock);
+        if (session->conn_ps.sock >= 0) {
+            sm.del(sm.h, session->conn_ps.sock);
+        }
     }
     return -1;
 }
@@ -475,11 +488,33 @@ proxy_request_error:
 int handle_epollout_event(epoll_data *edp)
 {
     session_t   *s;
+    int         so_error = 0;
+    socklen_t   so_len = sizeof(so_error);
 
     log_debug("enter %s\n", __FUNCTION__);
 
     s = sm.get(sm.hc, edp->fd);
     if (edp->flag == EPOLL_PROXY_SERVER && s != NULL) {
+        /* Check if async connect succeeded by reading SO_ERROR */
+        if (getsockopt(edp->fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0) {
+            log_error("getsockopt(SO_ERROR)");
+            print_payload((u_char *) s->request,
+                          MIN(s->request_len, PAYLOAD_MAX_LENGTH));
+            sm.del(sm.hc, edp->fd);
+            return sec_send(s, TO_CLIENT, not_found_response,
+                            strlen(not_found_response));
+        }
+        
+        if (so_error != 0) {
+            log_debug("async connect failed: %s\n", strerror(so_error));
+            print_payload((u_char *) s->request,
+                          MIN(s->request_len, PAYLOAD_MAX_LENGTH));
+            sm.del(sm.hc, edp->fd);
+            return sec_send(s, TO_CLIENT, not_found_response,
+                            strlen(not_found_response));
+        }
+
+        /* Connect succeeded, move to established table */
         sm.put(sm.h, s);
         sm.del(sm.hc, edp->fd);
         if (sec_send(s, TO_SERVER, s->request, s->request_len) < 0) {
@@ -569,7 +604,9 @@ int sec_send(session_t *s, int direction, char *buf, size_t len)
         print_payload((u_char *) buf, MIN(len, PAYLOAD_MAX_LENGTH));
         /* EBADF, EPIPE, ECONNRESET */
         sm.close(s, sm.epfd);
-        sm.del(sm.h, s->conn_ps.sock);
+        if (s->conn_ps.sock >= 0) {
+            sm.del(sm.h, s->conn_ps.sock);
+        }
 
         return -1;
     }
@@ -805,6 +842,7 @@ session_t *create_session(mpool *pool, int sockfd)
 
     bzero((u_char *)s, sizeof(session_t));
     s->conn_pc.sock = sockfd;
+    s->conn_ps.sock = -1;  /* Initialize server socket to -1 (invalid) */
 
     if (getsockname(sockfd, (struct sockaddr *)&s->conn_pc.local, &len)
         == -1) {
@@ -834,7 +872,9 @@ int close_session(session_t *s, int epfd)
     log_debug("closing %-24s%-24s%-24s\n", buf,
               sockaddr_to_str(&s->conn_ps.local), s->host);
     close_socket(s->conn_pc.sock, epfd);
-    close_socket(s->conn_ps.sock, epfd);
+    if (s->conn_ps.sock >= 0) {
+        close_socket(s->conn_ps.sock, epfd);
+    }
 
     return 0;
 }
@@ -878,13 +918,22 @@ static int parse_host_field(char *hostname, char *ip, unsigned int *port)
 {
     int                 i;
     char               *p;
+    char               *portstr;
+    long                port_num;
     struct hostent     *he;
     struct in_addr    **addr_list;
 
     for (p = hostname; *p && *p != ':'; p++) ;
 
     if (*p != 0) {
-        *port = atoi(p);
+        /* Found ':' separator, extract port */
+        portstr = p + 1;
+        port_num = strtol(portstr, NULL, 10);
+        if (port_num <= 0 || port_num > 65535) {
+            log_debug("invalid port: %ld\n", port_num);
+            return -1;
+        }
+        *port = (unsigned int) port_num;
         *p = 0;
     } else {
         *port = 80;
@@ -930,20 +979,11 @@ static void log_core(const char *prompt, const char *format, ...)
 
 /*
  * handle Ctrl-C signal
+ * Safe: only sets a volatile flag, defers all I/O to main loop
  */
 static void INT_handler(int sig)
 {
-    char c;
-    signal(sig, SIG_IGN);
-    printf("Ouch, did you hit Ctrl-C?\n"
-           "Do you really want to quit [y/n]?");
-    c = getchar();
-    if (c == 'y' || c == 'Y') {
-        proxy_exit();
-        exit(0);
-    } else {
-        signal(SIGINT, INT_handler);
-    }
+    shutdown_requested = 1;
 }
 
 
